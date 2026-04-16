@@ -27,3 +27,6 @@ build/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+*serviceAccountKey*.json
+config/serviceAccountKey.json.json

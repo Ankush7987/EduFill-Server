@@ -22,20 +22,27 @@ app.set('trust proxy', 1);
 app.use(helmet());
 
 // 🛡️ Dynamic CORS Security: Localhost (Dev) aur Vercel (Prod) dono ke liye
-const allowedOrigins = process.env.NODE_ENV === 'production' 
-    ? ['https://edufills.com', 'https://www.edufills.com', 'https://edu-fill.vercel.app/'] // 🚨 Yahan apna asli Vercel URL zaroor daalein!
-    : ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174']; // Local React/Vite ports
+// 🛡️ CORS Security Setup
+const allowedOrigins = [
+    'https://edufills.com', 
+    'https://www.edufills.com', 
+    'https://aapki-website.vercel.app', // 🚨 Isey apne asli Vercel link se replace karein
+    'http://localhost:5173', // 🚀 FIX: Aapke local frontend ko live backend se connect karne ke liye
+    'http://localhost:3000'
+];
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Agar origin undefined hai (jaise Postman ya Server-to-Server call) ya allowed list me hai
+        // Agar origin undefined hai (jaise Postman) ya list me hai
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
             callback(new Error('❌ Blocked by EduFill CORS Security'));
         }
     },
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // Preflight (OPTIONS) requests allow karne ke liye
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
