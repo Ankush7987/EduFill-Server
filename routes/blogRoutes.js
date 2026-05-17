@@ -178,7 +178,9 @@ const getBearerToken = (req) => {
 };
 
 const verifyBlogAdmin = (req, res, next) => {
-  const expectedToken = String(process.env.BLOG_ADMIN_TOKEN || '').trim();
+  const expectedToken = String(
+  process.env.ADMIN_PANEL_TOKEN || process.env.BLOG_ADMIN_TOKEN || ''
+).trim();
 
   if (!expectedToken) {
     return res.status(500).json({
