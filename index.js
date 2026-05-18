@@ -13,6 +13,7 @@ require('dotenv').config();
 
 const Blog = require('./models/Blog');
 const LiveChat = require('./models/LiveChat');
+const LiveRequest = require('./models/LiveRequest');
 const { setLiveIO } = require('./services/liveSocketHub');
 const { startLiveOfferTimeoutJob } = require('./jobs/liveOfferTimeoutJob');
 const { startFirestoreLiveBridge } = require('./jobs/firestoreLiveBridge');
@@ -57,6 +58,152 @@ const safeDate = (value, fallback = new Date()) => {
   const date = value ? new Date(value) : fallback;
   if (Number.isNaN(date.getTime())) return fallback.toISOString().split('T')[0];
   return date.toISOString().split('T')[0];
+};
+
+
+const normalizeSenderType = (value) => {
+  const type = sanitizeString(value, 30).toLowerCase();
+
+  if (['agent', 'expert', 'employee', 'staff'].includes(type)) return 'agent';
+  if (['admin', 'administrator'].includes(type)) return 'admin';
+  if (['system', 'bot'].includes(type)) return 'system';
+  return 'student';
+};
+
+const normalizeRoomId = (value) => sanitizeString(value, 160);
+
+const resolveRoomId = (data = {}) => {
+  return normalizeRoomId(
+    data.roomId ||
+    data.chatRoomId ||
+    data.requestId ||
+    data.liveRequestId ||
+    data.firebaseRequestId ||
+    data.id
+  );
+};
+
+const buildSocketMessage = (data = {}) => {
+  const text = sanitizeString(data.text || data.message || data.content || '', MAX_SOCKET_MESSAGE_LENGTH);
+
+  return {
+    senderId: sanitizeString(data.senderId || data.userId || data.studentId || data.agentId || data.employeeId || '', 120),
+    senderName: sanitizeString(data.senderName || data.name || data.studentName || data.agentName || '', 80),
+    senderType: normalizeSenderType(data.senderType || data.senderRole || data.role || data.type),
+    text,
+    timestamp: new Date(),
+  };
+};
+
+const makeRoomCandidates = (roomId) => {
+  const clean = normalizeRoomId(roomId);
+  return Array.from(new Set([
+    clean,
+    `live:${clean}`,
+    `request:${clean}`,
+    `room:${clean}`,
+    `room_${clean}`,
+  ].filter(Boolean)));
+};
+
+const emitMessageToRoom = (roomId, message) => {
+  const payload = {
+    ...message,
+    roomId,
+  };
+
+  io.to(roomId).emit('receive_message', payload);
+  io.to(roomId).emit('receiveMessage', payload);
+  io.to(roomId).emit('chat:new_message', payload);
+  io.to(roomId).emit('live:message', payload);
+};
+
+const emitHistoryToSocket = (socket, messages = [], roomId = '') => {
+  const payload = messages.slice(-MAX_SOCKET_HISTORY_MESSAGES);
+
+  socket.emit('chat_history', payload);
+  socket.emit('chatHistory', payload);
+  socket.emit('messages', payload);
+  socket.emit('live:chat_history', { roomId, messages: payload });
+};
+
+const getRequestMetaForRoom = async (roomId) => {
+  try {
+    const ids = makeRoomCandidates(roomId);
+
+    const request = await LiveRequest.findOne({
+      $or: [
+        { _id: ids.find((id) => /^[0-9a-fA-F]{24}$/.test(id)) || null },
+        { firebaseRequestId: { $in: ids } },
+      ],
+    }).lean();
+
+    if (!request) return {};
+
+    return {
+      requestId: String(request._id || ''),
+      firebaseRequestId: request.firebaseRequestId || '',
+      studentId: request.firebaseUserId || request.userId || '',
+      agentId: String(request.acceptedAgentId || request.offerAgentId || ''),
+      studentName: request.name || request.studentName || 'Student',
+      agentName: request.acceptedAgentName || request.offerAgentName || 'Expert Agent',
+    };
+  } catch (error) {
+    if (!IS_PRODUCTION) console.warn('Unable to resolve live request meta for chat:', error.message);
+    return {};
+  }
+};
+
+const saveSocketMessage = async (roomId, rawMessage, roomMeta = {}) => {
+  const cleanRoomId = normalizeRoomId(roomId);
+  const message = buildSocketMessage(rawMessage);
+
+  if (!cleanRoomId || !message.text) {
+    const error = new Error('roomId and message text are required.');
+    error.status = 400;
+    throw error;
+  }
+
+  const meta = {
+    ...(await getRequestMetaForRoom(cleanRoomId)),
+    ...roomMeta,
+  };
+
+  const update = {
+    $set: {
+      updatedAt: new Date(),
+      isClosed: false,
+    },
+    $setOnInsert: {
+      roomId: cleanRoomId,
+      requestId: meta.requestId || rawMessage.requestId || '',
+      firebaseRequestId: meta.firebaseRequestId || rawMessage.firebaseRequestId || '',
+      studentId: meta.studentId || rawMessage.studentId || '',
+      agentId: meta.agentId || rawMessage.agentId || rawMessage.employeeId || '',
+      studentName: sanitizeString(meta.studentName || rawMessage.studentName || 'Student', 80),
+      agentName: sanitizeString(meta.agentName || rawMessage.agentName || 'Expert Agent', 80),
+      messages: [],
+    },
+    $push: {
+      messages: {
+        $each: [message],
+        $slice: -MAX_SOCKET_HISTORY_MESSAGES,
+      },
+    },
+  };
+
+  await LiveChat.findOneAndUpdate(
+    { roomId: cleanRoomId },
+    update,
+    {
+      upsert: true,
+      new: true,
+      runValidators: true,
+      returnDocument: 'after',
+    }
+  );
+
+  return message;
 };
 
 const getFirebaseServiceAccount = () => {
@@ -234,102 +381,137 @@ const io = new Server(server, {
 });
 
 setLiveIO(io);
+app.set('io', io);
+app.locals.io = io;
 
 io.on('connection', (socket) => {
   if (!IS_PRODUCTION) {
     console.log('User connected to chat:', socket.id);
   }
 
-  socket.on('join_room', async (data = {}) => {
-    const roomId = sanitizeString(data?.roomId || data, 120);
-    const studentName = sanitizeString(data?.studentName || 'Student', 80);
+  const joinRoomHandler = async (data = {}, ack) => {
+    const roomId = resolveRoomId(data);
+    const studentName = sanitizeString(data?.studentName || data?.name || 'Student', 80);
     const agentName = sanitizeString(data?.agentName || 'Expert Agent', 80);
 
-    if (!roomId) return;
+    if (!roomId) {
+      const response = { success: false, message: 'roomId/requestId is required.' };
+      socket.emit('chat_error', response);
+      if (typeof ack === 'function') ack(response);
+      return;
+    }
 
     socket.join(roomId);
 
     try {
+      const requestMeta = await getRequestMetaForRoom(roomId);
+
       const chatRoom = await LiveChat.findOneAndUpdate(
         { roomId },
         {
+          $set: {
+            updatedAt: new Date(),
+            isClosed: false,
+          },
           $setOnInsert: {
             roomId,
-            studentName,
-            agentName,
+            requestId: requestMeta.requestId || data.requestId || '',
+            firebaseRequestId: requestMeta.firebaseRequestId || data.firebaseRequestId || '',
+            studentId: requestMeta.studentId || data.studentId || '',
+            agentId: requestMeta.agentId || data.agentId || data.employeeId || '',
+            studentName: requestMeta.studentName || studentName,
+            agentName: requestMeta.agentName || agentName,
             messages: [],
           },
         },
         {
           upsert: true,
           new: true,
+          runValidators: true,
           returnDocument: 'after',
         }
       ).lean();
 
-      if (chatRoom?.messages?.length) {
-        socket.emit('chat_history', chatRoom.messages.slice(-MAX_SOCKET_HISTORY_MESSAGES));
-      }
+      const messages = chatRoom?.messages || [];
+      emitHistoryToSocket(socket, messages, roomId);
+
+      const response = { success: true, roomId, messages: messages.slice(-MAX_SOCKET_HISTORY_MESSAGES) };
+      if (typeof ack === 'function') ack(response);
     } catch (error) {
       console.error('Error joining chat room:', error.message);
-      socket.emit('chat_error', { message: 'Could not join chat room.' });
+      const response = { success: false, message: 'Could not join chat room.', error: error.message };
+      socket.emit('chat_error', response);
+      if (typeof ack === 'function') ack(response);
     }
-  });
+  };
 
-  socket.on('send_message', async (data = {}) => {
-    const roomId = sanitizeString(data.roomId, 120);
-    const senderId = sanitizeString(data.senderId, 120);
-    const senderType = sanitizeString(data.senderType, 30);
-    const text = sanitizeString(data.text, MAX_SOCKET_MESSAGE_LENGTH);
-
-    if (!roomId || !text) return;
-
-    const messageObj = {
-      senderId,
-      senderType,
-      text,
-      timestamp: new Date(),
-    };
+  const sendMessageHandler = async (data = {}, ack) => {
+    const roomId = resolveRoomId(data);
 
     try {
-      await LiveChat.findOneAndUpdate(
-        { roomId },
-        {
-          $setOnInsert: { roomId },
-          $push: {
-            messages: {
-              $each: [messageObj],
-              $slice: -MAX_SOCKET_HISTORY_MESSAGES,
-            },
-          },
-        },
-        {
-          upsert: true,
-          new: true,
-          returnDocument: 'after',
-        }
-      );
+      const messageObj = await saveSocketMessage(roomId, data);
+      emitMessageToRoom(roomId, messageObj);
 
-      io.to(roomId).emit('receive_message', messageObj);
+      const response = { success: true, roomId, message: messageObj };
+      if (typeof ack === 'function') ack(response);
     } catch (error) {
       console.error('Error saving message to DB:', error.message);
-      socket.emit('chat_error', { message: 'Message could not be sent.' });
+      const response = { success: false, message: error.status === 400 ? error.message : 'Message could not be sent.', error: error.message };
+      socket.emit('chat_error', response);
+      if (typeof ack === 'function') ack(response);
     }
-  });
+  };
 
-  socket.on('close_and_delete_chat', async (payload = {}) => {
-    const roomId = sanitizeString(payload.roomId, 120);
-    if (!roomId) return;
+  socket.on('join_room', joinRoomHandler);
+  socket.on('joinRoom', joinRoomHandler);
+  socket.on('chat:join', joinRoomHandler);
+  socket.on('live:join_room', joinRoomHandler);
+
+  socket.on('send_message', sendMessageHandler);
+  socket.on('sendMessage', sendMessageHandler);
+  socket.on('chat:send', sendMessageHandler);
+  socket.on('live:send_message', sendMessageHandler);
+
+  socket.on('close_and_delete_chat', async (payload = {}, ack) => {
+    const roomId = resolveRoomId(payload);
+    if (!roomId) {
+      const response = { success: false, message: 'roomId/requestId is required.' };
+      if (typeof ack === 'function') ack(response);
+      return;
+    }
 
     io.to(roomId).emit('chat_ended', {
+      roomId,
       message: 'Form completed successfully. Chat secured & closed.',
     });
 
     try {
-      await LiveChat.deleteOne({ roomId });
-      if (!IS_PRODUCTION) console.log(`Ephemeral chat deleted for room ${roomId}`);
+      const shouldDelete = payload.delete === true || payload.permanentDelete === true;
+
+      if (shouldDelete) {
+        await LiveChat.deleteOne({ roomId });
+        if (!IS_PRODUCTION) console.log(`Live chat permanently deleted for room ${roomId}`);
+      } else {
+        await LiveChat.updateOne(
+          { roomId },
+          {
+            $set: {
+              isClosed: true,
+              closedAt: new Date(),
+              updatedAt: new Date(),
+            },
+          }
+        );
+        if (!IS_PRODUCTION) console.log(`Live chat closed for room ${roomId}`);
+      }
+
+      const response = { success: true, roomId, closed: true, deleted: shouldDelete };
+      if (typeof ack === 'function') ack(response);
     } catch (error) {
-      console.error('Error deleting chat:', error.message);
+      console.error('Error closing chat:', error.message);
+      const response = { success: false, message: 'Could not close chat.', error: error.message };
+      socket.emit('chat_error', response);
+      if (typeof ack === 'function') ack(response);
     }
   });
 

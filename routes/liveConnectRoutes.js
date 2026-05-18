@@ -3,6 +3,7 @@ const admin = require('firebase-admin');
 const LiveAgent = require('../models/LiveAgent');
 const LiveRequest = require('../models/LiveRequest');
 const LiveOffer = require('../models/LiveOffer');
+const LiveChat = require('../models/LiveChat');
 const firebaseStudentAuth = require('../middleware/firebaseStudentAuth');
 const {
   routeRequestToNextAgent,
@@ -29,6 +30,186 @@ function hasDocs(docs = {}) {
 }
 
 router.get('/health', (req, res) => ok(res, { message: 'EduFill Live API is working', time: new Date().toISOString() }));
+
+const MAX_CHAT_MESSAGE_LENGTH = Number(process.env.MAX_CHAT_MESSAGE_LENGTH || 2000);
+const MAX_CHAT_HISTORY_MESSAGES = Number(process.env.MAX_CHAT_HISTORY_MESSAGES || 200);
+
+function sanitizeString(value, maxLength = 500) {
+  return String(value || '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function normalizeSenderType(value) {
+  const type = sanitizeString(value, 30).toLowerCase();
+
+  if (['agent', 'expert', 'employee', 'staff'].includes(type)) return 'agent';
+  if (['admin', 'administrator'].includes(type)) return 'admin';
+  if (['system', 'bot'].includes(type)) return 'system';
+  return 'student';
+}
+
+function makeRoomCandidates(roomId) {
+  const clean = sanitizeString(roomId, 160);
+  return Array.from(new Set([
+    clean,
+    `live:${clean}`,
+    `request:${clean}`,
+    `room:${clean}`,
+    `room_${clean}`,
+  ].filter(Boolean)));
+}
+
+function getRoomIdFromRequest(req) {
+  return sanitizeString(
+    req.params.roomId ||
+    req.params.requestId ||
+    req.body.roomId ||
+    req.body.requestId ||
+    req.body.firebaseRequestId,
+    160
+  );
+}
+
+function buildRestMessage(req) {
+  const body = req.body || {};
+  return {
+    senderId: sanitizeString(
+      body.senderId ||
+      body.userId ||
+      body.studentId ||
+      body.agentId ||
+      body.employeeId ||
+      req.headers['x-user-id'] ||
+      req.headers['x-agent-id'] ||
+      '',
+      120
+    ),
+    senderName: sanitizeString(body.senderName || body.name || body.studentName || body.agentName || req.headers['x-agent-name'] || '', 80),
+    senderType: normalizeSenderType(body.senderType || body.senderRole || body.role || body.type || req.headers['x-sender-type']),
+    text: sanitizeString(body.text || body.message || body.content || '', MAX_CHAT_MESSAGE_LENGTH),
+    timestamp: new Date(),
+  };
+}
+
+async function getRequestMeta(roomId) {
+  try {
+    const candidates = makeRoomCandidates(roomId);
+    const mongoId = candidates.find((id) => /^[0-9a-fA-F]{24}$/.test(id));
+
+    const request = await LiveRequest.findOne({
+      $or: [
+        ...(mongoId ? [{ _id: mongoId }] : []),
+        { firebaseRequestId: { $in: candidates } },
+      ],
+    }).lean();
+
+    if (!request) return {};
+
+    return {
+      requestId: String(request._id || ''),
+      firebaseRequestId: request.firebaseRequestId || '',
+      studentId: request.firebaseUserId || request.userId || '',
+      agentId: String(request.acceptedAgentId || request.offerAgentId || ''),
+      studentName: request.name || request.studentName || 'Student',
+      agentName: request.acceptedAgentName || request.offerAgentName || 'Expert Agent',
+    };
+  } catch (error) {
+    console.warn('Unable to read request meta for chat:', error.message);
+    return {};
+  }
+}
+
+function emitChatMessage(req, roomId, message) {
+  const io = req.app.get('io') || req.app.locals.io;
+  if (!io) return;
+
+  const payload = { ...message, roomId };
+  io.to(roomId).emit('receive_message', payload);
+  io.to(roomId).emit('receiveMessage', payload);
+  io.to(roomId).emit('chat:new_message', payload);
+  io.to(roomId).emit('live:message', payload);
+}
+
+// ===========================
+// LIVE CHAT REST API
+// Works with both roomId and requestId so frontend can call any one of these:
+// GET  /api/live/chat/:roomId/messages
+// POST /api/live/chat/:roomId/message
+// GET  /api/live/request/:requestId/chat
+// POST /api/live/request/:requestId/chat/message
+// ===========================
+
+router.get(['/chat/:roomId', '/chat/:roomId/messages', '/request/:requestId/chat', '/request/:requestId/messages'], async (req, res) => {
+  try {
+    const roomId = getRoomIdFromRequest(req);
+    if (!roomId) return fail(res, 400, 'roomId/requestId is required.');
+
+    const candidates = makeRoomCandidates(roomId);
+    const chat = await LiveChat.findOne({ roomId: { $in: candidates } }).lean();
+
+    return ok(res, {
+      roomId: chat?.roomId || roomId,
+      chat: chat || null,
+      messages: (chat?.messages || []).slice(-MAX_CHAT_HISTORY_MESSAGES),
+    });
+  } catch (error) {
+    return fail(res, 500, 'Unable to load chat messages.', error);
+  }
+});
+
+router.post(['/chat/:roomId/message', '/chat/:roomId/messages', '/request/:requestId/chat/message', '/request/:requestId/messages'], async (req, res) => {
+  try {
+    const roomId = getRoomIdFromRequest(req);
+    const message = buildRestMessage(req);
+
+    if (!roomId) return fail(res, 400, 'roomId/requestId is required.');
+    if (!message.text) return fail(res, 400, 'Message text is required.');
+
+    const meta = await getRequestMeta(roomId);
+
+    await LiveChat.findOneAndUpdate(
+      { roomId },
+      {
+        $set: {
+          updatedAt: new Date(),
+          isClosed: false,
+        },
+        $setOnInsert: {
+          roomId,
+          requestId: meta.requestId || req.body.requestId || '',
+          firebaseRequestId: meta.firebaseRequestId || req.body.firebaseRequestId || '',
+          studentId: meta.studentId || req.body.studentId || '',
+          agentId: meta.agentId || req.body.agentId || req.body.employeeId || '',
+          studentName: sanitizeString(meta.studentName || req.body.studentName || 'Student', 80),
+          agentName: sanitizeString(meta.agentName || req.body.agentName || 'Expert Agent', 80),
+          messages: [],
+        },
+        $push: {
+          messages: {
+            $each: [message],
+            $slice: -MAX_CHAT_HISTORY_MESSAGES,
+          },
+        },
+      },
+      {
+        upsert: true,
+        new: true,
+        runValidators: true,
+        returnDocument: 'after',
+      }
+    );
+
+    emitChatMessage(req, roomId, message);
+
+    return res.status(201).json({ success: true, roomId, message });
+  } catch (error) {
+    return fail(res, 500, 'Message could not be sent.', error);
+  }
+});
+
 
 // ===========================
 // STUDENT API
