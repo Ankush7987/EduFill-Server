@@ -31,12 +31,11 @@ const examSchema = new mongoose.Schema(
     syllabusLink: { type: String, default: '' },
     officialWebsite: { type: String, default: '' },
 
-    seoTitle: { type: String, default: '' },
-    metaDescription: { type: String, default: '' },
-    keywords: { type: String, default: '' },
-
-    // Duplicate index warning fix:
-    // Yahan unique + sparse hai, neeche schema.index({ slug: 1 }) dobara mat lagana.
+    // 🔥 100% ADVANCED SEO FIELDS 🔥
+    seoTitle: { type: String, default: '' },       // Recommended: Under 60 characters
+    metaDescription: { type: String, default: '' }, // Recommended: Under 160 characters
+    keywords: { type: String, default: '' },        // LSI keywords target
+    
     slug: {
       type: String,
       trim: true,
@@ -45,9 +44,12 @@ const examSchema = new mongoose.Schema(
       sparse: true,
     },
 
-    ogImage: { type: String, default: '' },
-    canonicalUrl: { type: String, default: '' },
+    ogImage: { type: String, default: '' }, // OpenGraph Social Share Image
+    canonicalUrl: { type: String, default: '' }, // Prevents duplicate content penalty
     robots: { type: String, default: 'index, follow' },
+    
+    // Google Schema.org structured data block (Auto-populated by backend)
+    structuredData: { type: Object, default: {} },
 
     status: {
       type: String,
@@ -58,9 +60,10 @@ const examSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Useful indexes only. Slug ka index dobara mat lagao.
+// High-Performance Compound Indexes for fast crawler discovery
 examSchema.index({ status: 1, lastDate: -1 });
 examSchema.index({ category: 1, status: 1 });
+examSchema.index({ slug: 1 }, { unique: true }); // Fast index for clean routing
 examSchema.index({
   title: 'text',
   department: 'text',
