@@ -239,40 +239,53 @@ const initFirebase = async () => {
 };
 
 // ─────────────────────────────────────────────
-// MONGODB
+// MONGODB  (UPDATED LOGIC FOR AUTO-RECONNECT & STABILITY)
 // ─────────────────────────────────────────────
+mongoose.set('strictQuery', false);
+
 const connectMongoDB = async () => {
   const mongoUri = process.env.MONGO_URI;
   if (!mongoUri) {
     console.error('MONGO_URI is missing.');
     return;
   }
-  mongoose.set('strictQuery', false);
-  await mongoose.connect(mongoUri, {
-    serverSelectionTimeoutMS: 5000,   // fail fast
-    socketTimeoutMS:          30_000,
-    connectTimeoutMS:         10_000,
-    maxPoolSize:              20,     // up from 10 — handles concurrent socket queries
-    minPoolSize:              5,      // keep warm connections alive between requests
-    maxIdleTimeMS:            60_000,
-    heartbeatFrequencyMS:     10_000,
+  
+  const options = {
+    serverSelectionTimeoutMS: 15000,  // Increased to allow DNS resolution
+    socketTimeoutMS:          45000,
+    connectTimeoutMS:         10000,
+    maxPoolSize:              20,     // handles concurrent socket queries
+    minPoolSize:              5,      // keep warm connections alive
+    maxIdleTimeMS:            60000,
+    heartbeatFrequencyMS:     10000,
     retryWrites:              true,
     retryReads:               true,
-  });
-  console.log('MongoDB Atlas connected');
+    family:                   4       // Force IPv4 to fix random DNS drops
+  };
+
+  try {
+    await mongoose.connect(mongoUri, options);
+    console.log('✅ MongoDB Atlas connected successfully');
+  } catch (error) {
+    console.error('❌ MongoDB initial connection error:', error.message);
+    // Resolving silently so Promise.all in startServer doesn't crash the nodemon process.
+    // It will schedule a retry in the background.
+    setTimeout(() => {
+      connectMongoDB().catch(e => console.error('MongoDB retry failed:', e.message));
+    }, 5000);
+  }
 };
 
 mongoose.connection.on('disconnected', () => {
-  console.warn('MongoDB disconnected — retrying in 5 s...');
-  setTimeout(() => {
-    if (mongoose.connection.readyState === 0) {
-      connectMongoDB().catch((e) => console.error('Reconnect failed:', e.message));
-    }
-  }, 5000);
+  console.warn('⚠️ MongoDB disconnected! App will keep running, Mongoose will try to reconnect...');
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB reconnected successfully!');
 });
 
 mongoose.connection.on('error', (err) => {
-  console.error('MongoDB runtime error:', err.message);
+  console.error('❌ MongoDB runtime error:', err.message);
 });
 
 // ─────────────────────────────────────────────
