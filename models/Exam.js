@@ -32,20 +32,20 @@ const examSchema = new mongoose.Schema(
     officialWebsite: { type: String, default: '' },
 
     // 🔥 100% ADVANCED SEO FIELDS 🔥
-    seoTitle: { type: String, default: '' },       // Recommended: Under 60 characters
-    metaDescription: { type: String, default: '' }, // Recommended: Under 160 characters
-    keywords: { type: String, default: '' },        // LSI keywords target
+    seoTitle: { type: String, default: '' },
+    metaDescription: { type: String, default: '' },
+    keywords: { type: String, default: '' },
     
     slug: {
       type: String,
       trim: true,
       lowercase: true,
-      unique: true,
+      unique: true, // Mongoose automatic iska index yahan bana dega
       sparse: true,
     },
 
-    ogImage: { type: String, default: '' }, // OpenGraph Social Share Image
-    canonicalUrl: { type: String, default: '' }, // Prevents duplicate content penalty
+    ogImage: { type: String, default: '' },
+    canonicalUrl: { type: String, default: '' },
     robots: { type: String, default: 'index, follow' },
     
     // Google Schema.org structured data block (Auto-populated by backend)
@@ -63,7 +63,7 @@ const examSchema = new mongoose.Schema(
 // High-Performance Compound Indexes for fast crawler discovery
 examSchema.index({ status: 1, lastDate: -1 });
 examSchema.index({ category: 1, status: 1 });
-examSchema.index({ slug: 1 }, { unique: true }); // Fast index for clean routing
+// (Duplicate slug index yahan se delete kar diya gaya hai)
 examSchema.index({
   title: 'text',
   department: 'text',
